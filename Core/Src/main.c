@@ -333,11 +333,14 @@ static void enter_critical_stop(void) {
     SystemClock_Config();
 }
 
+/* Every printf() ends up here; we send the text out two ways so we can always read it */
 int _write(int file, char *ptr, int len) {
+    (void)file;
+    HAL_UART_Transmit(&hlpuart1, (uint8_t *)ptr, (uint16_t)len, 100);   /* Send over USB to a serial terminal; works without the debugger */
     for (int i = 0; i < len; i++) {
-        ITM_SendChar((*ptr++));
+        ITM_SendChar(ptr[i]);                                           /* Also show in CubeIDE's debug console when debugging */
     }
-    return len;
+    return len;                                                         /* Tell printf all the text was sent */
 }
 
 /* USER CODE END 0 */
@@ -455,8 +458,8 @@ static void MX_IWDG_Init(void)
 static void MX_LPUART1_UART_Init(void)
 {
   hlpuart1.Instance = LPUART1;
-  hlpuart1.Init.BaudRate = 209700;
-  hlpuart1.Init.WordLength = UART_WORDLENGTH_7B;
+  hlpuart1.Init.BaudRate = 115200;                /* Serial speed most terminals use by default (was 209700) */
+  hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;  /* Send full 8-bit characters so text isn't garbled (was 7) */
   hlpuart1.Init.StopBits = UART_STOPBITS_1;
   hlpuart1.Init.Parity = UART_PARITY_NONE;
   hlpuart1.Init.Mode = UART_MODE_TX_RX;
