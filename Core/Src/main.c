@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include "power.h"   /* Power-mode test and control */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -362,6 +363,11 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+#if POWER_TEST
+  MX_GPIO_Init();          /* Set up pins */
+  MX_LPUART1_UART_Init();  /* Set up serial output */
+  power_test_run();        /* Run the power test instead of flight software; never returns, watchdog never started */
+#endif
   /* USER CODE END SysInit */
 
   MX_GPIO_Init();
