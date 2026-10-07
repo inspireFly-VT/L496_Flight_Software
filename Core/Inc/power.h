@@ -21,6 +21,15 @@ void power_set_run_range2(void);
 /* 2 MHz CPU on the low-power regulator: slowest running mode, least power. */
 void power_set_low_power_run(void);
 
+/* ---- Sleep modes: the CPU stops, peripherals keep running ---- */
+
+/* Sleep for the given number of seconds; the RTC wake-up timer wakes the chip. */
+void power_enter_sleep(uint32_t seconds);
+
+/* Low-power sleep: same, but entered from low-power run on the low-power regulator.
+ * Call power_set_low_power_run() first. */
+void power_enter_low_power_sleep(uint32_t seconds);
+
 /* ---- Test and diagnostics ---- */
 
 /* Runs the power-mode test. Never returns. */

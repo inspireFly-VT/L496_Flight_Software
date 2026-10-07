@@ -1,8 +1,9 @@
 /**
  * power.c - Power-mode control and test for the ChildQube flight board (STM32L496)
  *
- * Step 3: run modes. Switches between Range 1, Range 2 and low-power run,
- * and proves each switch by reading the chip's power and clock registers.
+ * Step 3: run modes (Range 1, Range 2, low-power run), proven by register reads.
+ * Step 4: sleep and low-power sleep, proven by a timer that only freezes
+ *         while the CPU sleeps, compared against the real-time clock.
  */
 #include "power.h"
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #define HOLD_MS 5000u   /* Time spent in each mode so current can be measured */
 
 extern UART_HandleTypeDef hlpuart1;      /* Serial port, set up in main.c */
+extern RTC_HandleTypeDef hrtc;           /* Real-time clock, shared with main.c */
 extern void SystemClock_Config(void);    /* Normal flight clock setup, in main.c */
 
 /* ============================== Serial helpers ============================== */
@@ -134,6 +136,137 @@ void power_set_low_power_run(void)
     serial_reinit();
 }
 
+/* ============================ Real-time clock =============================== */
+/* The RTC runs from the LSI oscillator (32 kHz) and keeps counting in every
+ * low-power mode, so it is the reference we compare everything against. */
+
+#define LSI_HZ      32000u
+#define WAKE_HZ     (LSI_HZ / 16u)      /* Wake-up timer counts at RTC clock / 16 = 2000 per second */
+
+/* Sets up the RTC for test mode (the flight software's MX_RTC_Init is skipped). */
+static void rtc_init(void)
+{
+    hrtc.Instance            = RTC;
+    hrtc.Init.HourFormat     = RTC_HOURFORMAT_24;
+    hrtc.Init.AsynchPrediv   = 127;     /* 32000 / 128 / 250 = exactly 1 tick per second on LSI */
+    hrtc.Init.SynchPrediv    = 249;
+    hrtc.Init.OutPut         = RTC_OUTPUT_DISABLE;
+    hrtc.Init.OutPutRemap    = RTC_OUTPUT_REMAP_NONE;
+    hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+    hrtc.Init.OutPutType     = RTC_OUTPUT_TYPE_OPENDRAIN;
+    if (HAL_RTC_Init(&hrtc) != HAL_OK) Error_Handler();   /* Also selects LSI as the RTC clock */
+}
+
+/* Current RTC time in milliseconds since midnight. */
+static uint32_t rtc_ms(void)
+{
+    RTC_TimeTypeDef t = {0};
+    RTC_DateTypeDef d = {0};
+    HAL_RTC_GetTime(&hrtc, &t, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &d, RTC_FORMAT_BIN);       /* Must follow GetTime to unlock the registers */
+    uint32_t frac = ((t.SecondFraction - t.SubSeconds) * 1000u) / (t.SecondFraction + 1u);
+    return (t.Hours * 3600u + t.Minutes * 60u + t.Seconds) * 1000u + frac;
+}
+
+static uint32_t rtc_ms_since(uint32_t start)
+{
+    uint32_t now = rtc_ms();
+    return (now >= start) ? (now - start) : (now + 86400000u - start);   /* Handles midnight rollover */
+}
+
+/* Starts the wake-up timer. Its event wakes the CPU without needing an interrupt
+ * handler, because we sleep with WFE and "send event on pending" turned on. */
+static void wake_timer_start(uint32_t seconds)
+{
+    HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+    __HAL_RTC_WAKEUPTIMER_EXTI_CLEAR_FLAG();
+    HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+    if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, seconds * WAKE_HZ - 1u,
+                                    RTC_WAKEUPCLOCK_RTCCLK_DIV16) != HAL_OK) Error_Handler();
+}
+
+static int wake_timer_fired(void)
+{
+    return __HAL_RTC_WAKEUPTIMER_GET_FLAG(&hrtc, RTC_FLAG_WUTF) != 0;
+}
+
+static void wake_timer_stop(void)
+{
+    HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
+    __HAL_RTC_WAKEUPTIMER_EXTI_CLEAR_FLAG();
+    HAL_NVIC_ClearPendingIRQ(RTC_WKUP_IRQn);
+}
+
+/* ============================ Sleep proof timer ============================= */
+/* TIM2 is set so its clock switches off ONLY while the CPU is in Sleep.
+ * If TIM2 barely moves while the RTC counts 5 s, the CPU really slept. */
+
+#define TIM2_HZ 10000u                  /* TIM2 counts 10,000 per second (0.1 ms per count) */
+
+static void tim2_start(void)
+{
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    __HAL_RCC_TIM2_CLK_SLEEP_DISABLE();               /* Key line: no TIM2 clock during Sleep */
+
+    uint32_t tim_clk = HAL_RCC_GetPCLK1Freq();
+    if ((RCC->CFGR & RCC_CFGR_PPRE1) != 0) tim_clk *= 2u;   /* Timers run at 2x bus speed when the bus is divided */
+
+    TIM2->CR1 = 0;
+    TIM2->PSC = tim_clk / TIM2_HZ - 1u;
+    TIM2->ARR = 0xFFFFFFFFu;
+    TIM2->EGR = TIM_EGR_UG;                            /* Load the prescaler now */
+    TIM2->CNT = 0;
+    TIM2->CR1 = TIM_CR1_CEN;
+}
+
+static void tim2_stop(void)
+{
+    TIM2->CR1 = 0;
+    __HAL_RCC_TIM2_CLK_SLEEP_ENABLE();                 /* Restore the default */
+    __HAL_RCC_TIM2_CLK_DISABLE();
+}
+
+/* =============================== Sleep modes ================================ */
+
+/* Shared by both sleep modes. Returns the TIM2 count and RTC time spent asleep. */
+static void sleep_for(uint32_t seconds, uint32_t regulator,
+                      uint32_t *tim2_ms, uint32_t *rtc_ms_out)
+{
+    serial_flush();                     /* Let the last message finish before sleeping */
+    tim2_start();
+    wake_timer_start(seconds);
+    HAL_SuspendTick();                  /* Otherwise the 1 ms tick wakes the CPU every millisecond */
+
+    uint32_t rtc_start = rtc_ms();
+    uint32_t tim_start = TIM2->CNT;
+
+    do {
+        HAL_PWR_EnterSLEEPMode(regulator, PWR_SLEEPENTRY_WFE);   /* CPU stops here until an event */
+    } while (!wake_timer_fired());      /* Ignore any other event and go back to sleep */
+
+    uint32_t tim_end = TIM2->CNT;
+    HAL_ResumeTick();
+
+    *tim2_ms    = (tim_end - tim_start) / (TIM2_HZ / 1000u);
+    *rtc_ms_out = rtc_ms_since(rtc_start);
+    wake_timer_stop();
+    tim2_stop();
+}
+
+static uint32_t g_last_tim2_ms, g_last_rtc_ms;     /* Evidence from the most recent sleep */
+
+void power_enter_sleep(uint32_t seconds)
+{
+    sleep_for(seconds, PWR_MAINREGULATOR_ON, &g_last_tim2_ms, &g_last_rtc_ms);
+}
+
+void power_enter_low_power_sleep(uint32_t seconds)
+{
+    sleep_for(seconds, PWR_LOWPOWERREGULATOR_ON, &g_last_tim2_ms, &g_last_rtc_ms);
+}
+
 /* ================================== Tests =================================== */
 
 static void print_reset_cause(void)
@@ -204,15 +337,52 @@ static int test_low_power_run(void)
     return report("Low-power run", pass);
 }
 
+/* Sleep proof: RTC shows ~5 s passed, but TIM2 (no clock in Sleep) barely moved. */
+static int sleep_evidence_ok(void)
+{
+    printf("  Asleep: RTC counted %lu ms, TIM2 (stops in Sleep) counted %lu ms\r\n",
+           (unsigned long)g_last_rtc_ms, (unsigned long)g_last_tim2_ms);
+    int rtc_ok = g_last_rtc_ms >= (HOLD_MS * 9u / 10u) && g_last_rtc_ms <= (HOLD_MS * 13u / 10u);
+    int tim_ok = g_last_tim2_ms * 10u < g_last_rtc_ms;   /* Awake less than 10% of the time */
+    return rtc_ok && tim_ok;
+}
+
+static int test_sleep(void)
+{
+    printf("-- Sleep (CPU stopped, main regulator)\r\n");
+    power_set_run_range1();
+    power_print_state();
+    printf("  Sleeping %lu s - measure current now\r\n", (unsigned long)(HOLD_MS / 1000u));
+    power_enter_sleep(HOLD_MS / 1000u);
+    return report("Sleep", sleep_evidence_ok());
+}
+
+static int test_low_power_sleep(void)
+{
+    printf("-- Low-power sleep (CPU stopped, low-power regulator)\r\n");
+    power_set_low_power_run();
+    power_print_state();
+    printf("  Sleeping %lu s - measure current now\r\n", (unsigned long)(HOLD_MS / 1000u));
+    power_enter_low_power_sleep(HOLD_MS / 1000u);
+    int lp_on = lp_regulator_active();                 /* Still on the low-power regulator after waking */
+    printf("  Low-power regulator active after wake: %d\r\n", lp_on);
+    return report("Low-power sleep", sleep_evidence_ok() && lp_on);
+}
+
 void power_test_run(void)
 {
     printf("\r\n===== POWER MODE TEST =====\r\n");
     print_reset_cause();
+    rtc_init();
+    HAL_PWR_EnableSEVOnPend();       /* Let the RTC wake-up event wake the CPU from WFE */
+    HAL_DBGMCU_DisableDBGSleepMode();/* A debugger must not keep clocks running in Sleep */
 
     int passed = 0, total = 0;
     passed += test_run_range1();     total++;
     passed += test_run_range2();     total++;
     passed += test_low_power_run();  total++;
+    passed += test_sleep();          total++;
+    passed += test_low_power_sleep(); total++;
 
     power_set_run_range1();          /* Back to normal clocks */
     printf("===== %d/%d PASSED =====\r\n", passed, total);
