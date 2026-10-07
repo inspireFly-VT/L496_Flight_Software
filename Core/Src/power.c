@@ -4,6 +4,8 @@
  * Step 3: run modes (Range 1, Range 2, low-power run), proven by register reads.
  * Step 4: sleep and low-power sleep, proven by a timer that only freezes
  *         while the CPU sleeps, compared against the real-time clock.
+ * Step 5: Stop 0, 1 and 2, proven by the millisecond tick freezing while the
+ *         RTC keeps counting, the chip waking on MSI, and the Stop level register.
  */
 #include "power.h"
 #include <stdio.h>
@@ -267,6 +269,49 @@ void power_enter_low_power_sleep(uint32_t seconds)
     sleep_for(seconds, PWR_LOWPOWERREGULATOR_ON, &g_last_tim2_ms, &g_last_rtc_ms);
 }
 
+/* ================================ Stop modes ================================ */
+
+/* Re-reads the RTC after Stop: its readable copy of the time is stale on wake-up. */
+static void rtc_resync(void)
+{
+    __HAL_RTC_WRITEPROTECTION_DISABLE(&hrtc);
+    HAL_RTC_WaitForSynchro(&hrtc);
+    __HAL_RTC_WRITEPROTECTION_ENABLE(&hrtc);
+}
+
+/* Evidence captured from the most recent Stop, before anything changes it */
+static uint32_t g_stop_tick_ms;      /* How far the 1 ms tick moved (should be ~0) */
+static uint32_t g_stop_rtc_ms;       /* How far the RTC moved (should be ~5000) */
+static uint32_t g_stop_wake_clock;   /* Clock running right after wake (should be MSI) */
+static uint32_t g_stop_lpms;         /* Stop level recorded in PWR_CR1 (0, 1 or 2) */
+
+void power_enter_stop(uint32_t level, uint32_t seconds)
+{
+    serial_flush();                     /* Let the last message finish before clocks stop */
+    wake_timer_start(seconds);
+
+    uint32_t rtc_start  = rtc_ms();
+    uint32_t tick_start = HAL_GetTick();
+
+    do {
+        switch (level) {                /* CPU and almost all clocks stop here until the RTC wakes us */
+            case 0:  HAL_PWREx_EnterSTOP0Mode(PWR_STOPENTRY_WFE); break;
+            case 1:  HAL_PWREx_EnterSTOP1Mode(PWR_STOPENTRY_WFE); break;
+            default: HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFE); break;
+        }
+    } while (!wake_timer_fired());      /* Ignore any other event and stop again */
+
+    /* Capture evidence first: restoring the clocks would overwrite it */
+    g_stop_wake_clock = __HAL_RCC_GET_SYSCLK_SOURCE();
+    g_stop_tick_ms    = HAL_GetTick() - tick_start;
+    g_stop_lpms       = (PWR->CR1 & PWR_CR1_LPMS) >> PWR_CR1_LPMS_Pos;
+
+    power_set_run_range1();             /* Chip wakes on slow MSI: bring back the 32 MHz PLL */
+    rtc_resync();
+    g_stop_rtc_ms = rtc_ms_since(rtc_start);
+    wake_timer_stop();
+}
+
 /* ================================== Tests =================================== */
 
 static void print_reset_cause(void)
@@ -290,7 +335,7 @@ static void print_reset_cause(void)
     __HAL_PWR_CLEAR_FLAG(PWR_FLAG_SB);
 }
 
-/* Prints PASS/FAIL for one test and returns 1 if it passed */
+/* Prints Pass or Fail for one test and returns 1 if it passed */
 static int report(const char *name, int pass)
 {
     printf("  [%s] %s\r\n\r\n", pass ? "PASS" : "FAIL", name);
@@ -369,6 +414,30 @@ static int test_low_power_sleep(void)
     return report("Low-power sleep", sleep_evidence_ok() && lp_on);
 }
 
+static int test_stop(uint32_t level)
+{
+    printf("-- Stop %lu\r\n", (unsigned long)level);
+    power_set_run_range1();
+    power_print_state();
+    printf("  Stopping %lu s - measure current now\r\n", (unsigned long)(HOLD_MS / 1000u));
+    power_enter_stop(level, HOLD_MS / 1000u);
+
+    printf("  In Stop: RTC counted %lu ms, 1 ms tick counted %lu ms\r\n",
+           (unsigned long)g_stop_rtc_ms, (unsigned long)g_stop_tick_ms);
+    printf("  Woke on clock: %s   Stop level register (LPMS): %lu\r\n",
+           g_stop_wake_clock == RCC_SYSCLKSOURCE_STATUS_MSI ? "MSI" : "not MSI",
+           (unsigned long)g_stop_lpms);
+
+    int rtc_ok   = g_stop_rtc_ms >= (HOLD_MS * 9u / 10u) && g_stop_rtc_ms <= (HOLD_MS * 13u / 10u);
+    int tick_ok  = g_stop_tick_ms * 10u < g_stop_rtc_ms;            /* Tick frozen almost the whole time */
+    int clock_ok = g_stop_wake_clock == RCC_SYSCLKSOURCE_STATUS_MSI; /* Stop always switches off the PLL */
+    int level_ok = g_stop_lpms == level;
+
+    char name[8] = "Stop 0";
+    name[5] = (char)('0' + level);
+    return report(name, rtc_ok && tick_ok && clock_ok && level_ok);
+}
+
 void power_test_run(void)
 {
     printf("\r\n===== POWER MODE TEST =====\r\n");
@@ -376,6 +445,7 @@ void power_test_run(void)
     rtc_init();
     HAL_PWR_EnableSEVOnPend();       /* Let the RTC wake-up event wake the CPU from WFE */
     HAL_DBGMCU_DisableDBGSleepMode();/* A debugger must not keep clocks running in Sleep */
+    HAL_DBGMCU_DisableDBGStopMode(); /* ...or in Stop */
 
     int passed = 0, total = 0;
     passed += test_run_range1();     total++;
@@ -383,6 +453,9 @@ void power_test_run(void)
     passed += test_low_power_run();  total++;
     passed += test_sleep();          total++;
     passed += test_low_power_sleep(); total++;
+    passed += test_stop(0);          total++;
+    passed += test_stop(1);          total++;
+    passed += test_stop(2);          total++;
 
     power_set_run_range1();          /* Back to normal clocks */
     printf("===== %d/%d PASSED =====\r\n", passed, total);

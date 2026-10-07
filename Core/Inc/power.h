@@ -30,6 +30,13 @@ void power_enter_sleep(uint32_t seconds);
  * Call power_set_low_power_run() first. */
 void power_enter_low_power_sleep(uint32_t seconds);
 
+/* ---- Stop modes: almost all clocks frozen, memory and registers kept ---- */
+
+/* Enters Stop 0, 1 or 2 for the given number of seconds (RTC wake-up timer),
+ * then restores the normal flight clocks. The program continues where it left off.
+ * Stop 0 = fastest wake-up, most current. Stop 2 = lowest current (~1 uA range). */
+void power_enter_stop(uint32_t level, uint32_t seconds);
+
 /* ---- Test and diagnostics ---- */
 
 /* Runs the power-mode test. Never returns. */
